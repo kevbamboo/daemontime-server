@@ -1,58 +1,82 @@
 .game-card {
-  height: 135px;
-  perspective: 1000px;
-}
-
-.game-card-inner {
+  --card-edge: #454545;
+  --card-glow: rgb(230 57 70 / 38%);
   position: relative;
+  display: block;
+  box-sizing: border-box;
+  min-width: 0;
   width: 100%;
-  height: 100%;
+  height: 135px;
+  padding: 18px;
+  overflow: hidden;
+  text-align: left;
+  color: inherit;
+  background: #111111;
+  border: 1px solid var(--panel-line, #626262);
+  border-radius: 4px;
+  box-shadow:
+    inset 1px 1px 0 rgb(255 255 255 / 12%),
+    1px 1px 0 var(--card-edge),
+    2px 2px 0 var(--card-edge),
+    3px 3px 0 var(--card-edge),
+    4px 4px 0 var(--card-edge),
+    7px 9px 16px rgb(0 0 0 / 32%);
+  cursor: pointer;
+  transition: transform 180ms ease, box-shadow 180ms ease;
 }
 
-/* =========================
-   FLIPPING CONTENT
-   ========================= */
-
-.game-card-flip {
-  position: absolute;
-  inset: 0;
-  transition: transform 0.45s ease;
-  transform-style: preserve-3d;
+.game-card:hover:not(:disabled),
+.game-card:focus-visible:not(:disabled) {
+  box-shadow:
+    inset 1px 1px 0 rgb(255 255 255 / 16%),
+    1px 1px 0 var(--card-edge),
+    2px 2px 0 var(--card-edge),
+    3px 3px 0 var(--card-edge),
+    4px 4px 0 var(--card-edge),
+    5px 5px 0 var(--card-edge),
+    6px 6px 0 var(--card-edge),
+    0 0 20px var(--card-glow),
+    9px 12px 20px rgb(0 0 0 / 32%);
+  transform: translate(-2px, -2px);
 }
 
-.game-card:hover .game-card-flip {
-  transform: rotateY(180deg);
+.game-card:focus-visible {
+  outline: 2px solid #e63946;
+  outline-offset: 3px;
+}
+
+.game-card:disabled {
+  cursor: not-allowed;
 }
 
 .game-card-front,
 .game-card-back {
   position: absolute;
-  inset: 0;
-
-  box-sizing: border-box;
-  padding: 18px;
-
-  background: #111111;
-  border: 1px solid #292929;
-  border-radius: 4px;
-
-  backface-visibility: hidden;
-}
-
-/* =========================
-   FRONT
-   ========================= */
-
-.game-card-front {
+  inset: 18px;
   display: flex;
   flex-direction: column;
+}
+
+.game-card-back {
+  justify-content: center;
+  text-align: center;
+  visibility: hidden;
+}
+
+.game-card:hover .game-card-front,
+.game-card:focus-visible .game-card-front {
+  visibility: hidden;
+}
+
+.game-card:hover .game-card-back,
+.game-card:focus-visible .game-card-back {
+  visibility: visible;
 }
 
 .game-card-status {
   display: flex;
   align-items: center;
   gap: 7px;
-
   color: #999999;
   font-size: 10px;
   font-weight: 700;
@@ -72,18 +96,22 @@
 }
 
 .game-card-info {
+  position: absolute;
+  inset: 0;
   display: flex;
-  gap: 30px;
-  margin-top: auto;
+  flex-direction: column;
+  justify-content: center;
+  gap: 7px;
+  text-align: center;
 }
 
-.game-card-info div {
+.game-card-info > span {
   display: flex;
   flex-direction: column;
   gap: 3px;
 }
 
-.game-card-info span {
+.game-card-label {
   color: #666666;
   font-size: 9px;
   font-weight: 700;
@@ -91,20 +119,18 @@
 }
 
 .game-card-info strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: #cccccc;
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 15px;
+  font-weight: 700;
 }
 
-/* =========================
-   BACK
-   ========================= */
-
-.game-card-back {
-  display: flex;
-  flex-direction: column;
-
-  transform: rotateY(180deg);
+.game-card-player-count {
+  color: #999999;
+  font-size: 11px;
+  font-weight: 400;
 }
 
 .game-card-back-title {
@@ -115,12 +141,13 @@
 }
 
 .game-card-details {
-  display: flex;
-  gap: 35px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
   margin-top: 12px;
 }
 
-.game-card-details div {
+.game-card-details > span {
   display: flex;
   flex-direction: column;
 }
@@ -130,64 +157,39 @@
   font-size: 20px;
 }
 
-.game-card-details span {
+.game-card-details span span {
   color: #777777;
   font-size: 10px;
 }
 
-/* =========================
-   FIXED JOIN BUTTON
-   ========================= */
-
-.game-card-join-button {
-  position: absolute;
-  right: 18px;
-  bottom: 18px;
-  z-index: 10;
-
-  height: 34px;
-  padding: 0 13px;
-
-  border: none;
-  border-radius: 3px;
-
-  background: #e63946;
-  color: white;
-
-  font-size: 12px;
-  font-weight: 700;
-
-  cursor: pointer;
-
-  transition: background 0.15s ease;
+.light-theme .game-card {
+  --card-edge: #948973;
+  --card-glow: rgb(129 237 247 / 60%);
 }
 
-.game-card-join-button:hover {
-  background: #c92f3b;
-}
-
-.game-card-join-button:disabled {
-  background: #333333;
-  color: #777777;
-  cursor: not-allowed;
-}
-
-.game-card-join-button span {
-  margin-left: 4px;
-}
-
-/* =========================
-   RESPONSIVE
-   ========================= */
-
-@media (max-width: 1100px) {
-  .game-card {
-    height: 135px;
-  }
+.light-theme .game-card-details strong {
+  color: #000000;
 }
 
 @media (max-width: 500px) {
   .game-card {
     height: 140px;
+    padding: 16px;
+  }
+
+  .game-card-front,
+  .game-card-back {
+    inset: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .game-card {
+    transition: none;
+  }
+
+  .game-card:hover:not(:disabled),
+  .game-card:focus-visible:not(:disabled) {
+    transform: none;
   }
 }

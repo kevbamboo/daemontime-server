@@ -8,7 +8,7 @@ function findCurrentGame(games: Game[]) {
 function isFinished(update: GameUpdate | null) {
   return update?.phase === 'finished' || update?.phase === 'interrupted';
 }
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import EmptyLobby from "./EmptyLobby";
 import MessageBox from "./MessageBox";
 import GameCard from "./GameCard";
@@ -71,6 +71,12 @@ export default function GameBox() {
   }, []);
   const game = findCurrentGame(games);
   const hasGameTab = !!game;
+  const useNativeCursor = creating || hasGameTab;
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.toggleAttribute("data-native-cursor", useNativeCursor);
+    return () => root.removeAttribute("data-native-cursor");
+  }, [useNativeCursor]);
   const selectedTab = activeTab === "game" && !hasGameTab ? "lobby" : activeTab;
   const gameEnded = isFinished(gameUpdate);
   async function action(fn: () => Promise<unknown>) {

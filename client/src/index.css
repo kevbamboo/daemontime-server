@@ -131,8 +131,7 @@ body.light-theme {
 .light-theme .login-card,
 .light-theme #signup-form,
 .light-theme .modal-card,
-.light-theme .game-card-front,
-.light-theme .game-card-back {
+.light-theme .game-card {
   background: #fffaf0;
   border-color: #000000;
 }

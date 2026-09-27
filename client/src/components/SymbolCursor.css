@@ -1,0 +1,70 @@
+html.symbol-cursor-active:not([data-native-cursor]),
+html.symbol-cursor-active:not([data-native-cursor]) * {
+  cursor: none !important;
+}
+
+html[data-native-cursor] .symbol-cursor-layer {
+  display: none;
+}
+
+.symbol-cursor-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  color: #f5f5f5;
+}
+
+.light-theme .symbol-cursor-layer {
+  color: #111111;
+}
+
+.symbol-cursor,
+.symbol-cursor-trail {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 24px;
+  height: 24px;
+  margin: -12px 0 0 -12px;
+  text-align: center;
+  font: 700 22px / 24px "Courier New", Courier, monospace;
+  text-shadow: 0 0 2px #111111;
+}
+
+.light-theme .symbol-cursor,
+.light-theme .symbol-cursor-trail {
+  text-shadow: 0 0 2px #fffaf0;
+}
+
+.symbol-cursor-glyph {
+  display: block;
+  width: 24px;
+  height: 24px;
+  overflow: visible;
+  fill: currentColor;
+  font: 700 22px / 24px "Courier New", Courier, monospace;
+}
+
+.symbol-cursor-trail {
+  animation: symbol-cursor-fall 450ms ease-out forwards;
+}
+
+@keyframes symbol-cursor-fall {
+  from {
+    opacity: 0.65;
+    transform: translate(0, 0) rotate(0deg);
+  }
+  to {
+    opacity: 0;
+    transform: translate(var(--drift), var(--fall-distance)) rotate(var(--rotation));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .symbol-cursor-trail {
+    display: none;
+  }
+}
