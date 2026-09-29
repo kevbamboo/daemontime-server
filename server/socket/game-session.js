@@ -61,10 +61,12 @@ export function createGameSessions({
       totalQuestions: session.questions.length,
       submitted: !!answer,
       yourAnswer: answer?.choice ?? null,
+      ...(answer ? { yourAnswerPoints: answer.points } : {}),
       scores: session.players
         .map((player) => ({
           ...player,
           score: session.scores[player.id],
+          answerPoints: session.answers[session.index]?.[player.id]?.points,
           submitted: !!session.answers[session.index]?.[player.id],
           active: session.active.has(player.id),
         }))

@@ -201,3 +201,55 @@ test("stop cancels all timers and malformed question records are rejected", () =
     );
   }
 });
+
+test("snapshots send personal answer points and reset them each question", () => {
+  const { sessions, get, tick, updates } = fixture(2, 3);
+  assert.equal(get("a").yourAnswerPoints, undefined);
+  tick(3000);
+  assert.equal(get("a").yourAnswerPoints, undefined);
+  sessions.submit("game", "a", 0, 2);
+  assert.equal(get("a").yourAnswerPoints, 3);
+  assert.equal(updates.findLast(({ userId }) => userId === "a").update.yourAnswerPoints, 3);
+  assert.equal(get("b").yourAnswerPoints, undefined);
+  sessions.submit("game", "b", 0, 1);
+  assert.equal(get("b").yourAnswerPoints, 0);
+  assert.equal(get("a").yourAnswerPoints, 3);
+  sessions.submit("game", "c", 0, 2);
+  assert.equal(get("c").yourAnswerPoints, 2);
+  assert.equal(get("a").phase, "scoreboard");
+  tick(3000);
+  for (const id of ["a", "b", "c"]) {
+    assert.equal(get(id).yourAnswerPoints, undefined);
+  }
+  sessions.submit("game", "a", 1, 1);
+  assert.equal(get("a").yourAnswerPoints, 0);
+  tick(8000);
+  assert.equal(get("a").phase, "finished");
+  assert.equal(get("a").yourAnswerPoints, 0);
+  assert.equal(get("b").yourAnswerPoints, undefined);
+});
+
+test("all players receive each player's round points without their answer choices", () => {
+  const { sessions, get, tick, updates } = fixture(2, 3);
+  tick(3000);
+  sessions.submit("game", "a", 0, 2);
+  sessions.submit("game", "b", 0, 1);
+  for (const viewer of ["a", "b", "c"]) {
+    const scores = updates.findLast(({ userId }) => userId === viewer).update.scores;
+    assert.equal(scores.find((p) => p.id === "a").answerPoints, 3);
+    assert.equal(scores.find((p) => p.id === "b").answerPoints, 0);
+    assert.equal(scores.find((p) => p.id === "c").answerPoints, undefined);
+    assert.ok(scores.every((p) => !("choice" in p) && !("correctAnswer" in p)));
+  }
+  sessions.submit("game", "c", 0, 2);
+  for (const viewer of ["a", "b", "c"]) {
+    assert.deepEqual(get(viewer).scores.map((p) => [p.id, p.answerPoints]), [
+      ["a", 3], ["c", 2], ["b", 0],
+    ]);
+  }
+  tick(3000);
+  assert.ok(get("a").scores.every((p) => p.answerPoints === undefined));
+  sessions.submit("game", "a", 1, 1);
+  assert.equal(get("b").scores.find((p) => p.id === "a").answerPoints, 0);
+  assert.equal(get("b").scores.find((p) => p.id === "a").score, 3);
+});

@@ -9,19 +9,28 @@ import { supabase } from "./lib/supabase.js";
 import { createGameStore } from "./db/game-store.js";
 dotenv.config();
 
+const frontendUrlSetting =
+  process.env.NODE_ENV === "production"
+    ? "FRONTEND_URL_PRODUCTION"
+    : "FRONTEND_URL_DEVELOPMENT";
+const frontendUrl = process.env[frontendUrlSetting];
+if (!frontendUrl) {
+  throw new Error(`Missing required environment variable: ${frontendUrlSetting}`);
+}
+
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.FRONTEND_URL,
+    origin: frontendUrl,
     methods: ["GET", "POST"],
     credentials: true,
   },
 });
 
 app.use(express.json());
-app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
+app.use(cors({ origin: frontendUrl, credentials: true }));
 
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.url}`);
@@ -62,6 +71,6 @@ server.on("error", (error) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, "127.0.0.1", () => {
   console.log(`Server listening on port ${server.address().port}`);
 });
