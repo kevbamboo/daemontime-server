@@ -1,5 +1,5 @@
 import { supabase } from "../lib/supabase.js";
-import { loadQuestionBank } from "../socket/index.socket.js";
+import { loadQuestionBank } from "../db/question-bank.js";
 
 // Read-only check: print schema/counts, never credentials or question contents.
 const response = await fetch(`${process.env.SUPABASE_URL}/rest/v1/`, {
@@ -25,8 +25,9 @@ console.log(
   JSON.stringify({
     loadedQuestions: questions.length,
     allChoicesHaveFourStrings: questions.every(
-      (q) =>
-        q.choices.length === 4 && q.choices.every((c) => typeof c === "string"),
+      (question) =>
+        question.choices.length === 4 &&
+        question.choices.every((choice) => typeof choice === "string"),
     ),
   }),
 );

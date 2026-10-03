@@ -1,129 +1,146 @@
-// Map the socket model to the existing currentGames PostgreSQL columns.
-export async function createGameStore(
-  supabase,
-  { timeLimit, numberOfQuestions },
-) {
-  const games = new Map();
-  const rows = new Map();
-  const table = "currentGames";
-  const pageSize = 1000;
-  if (
-    !Number.isInteger(timeLimit) ||
-    timeLimit <= 0 ||
-    !Number.isInteger(numberOfQuestions) ||
-    numberOfQuestions <= 0
-  ) {
-    throw new Error(
-      "Configure positive integer game time and question-count defaults.",
-    );
+import { validateGameSettings } from "../lib/game-settings.js";
+
+const TABLE = "currentGames";
+const PAGE_SIZE = 1000;
+const QUERY_TIMEOUT_MS = 5000;
+const GAME_COLUMNS =
+  "game_id,host_id,host_handle,users_in_game,state,time_limit,number_of_questions";
+
+function gameFromRow(row) {
+  return {
+    gameId: row.game_id,
+    hostId: row.host_id,
+    timeLimit: row.time_limit,
+    numberOfQuestions: row.number_of_questions,
+    players: row.users_in_game.map((id) => ({
+      id,
+      username: id === row.host_id ? row.host_handle : `Player-${id.slice(0, 8)}`,
+    })),
+    started: row.state !== "waiting",
+  };
+}
+
+function rowFromGame(game) {
+  const host = game.players.find((player) => player.id === game.hostId);
+  if (!host) {
+    throw new Error("The game host must be one of its players.");
   }
-  for (let offset = 0; ; offset += pageSize) {
+
+  return {
+    game_id: game.gameId,
+    host_id: game.hostId,
+    host_handle: host.username,
+    users_in_game: game.players.map((player) => player.id),
+    state: game.started ? "started" : "waiting",
+    time_limit: game.timeLimit,
+    number_of_questions: game.numberOfQuestions,
+  };
+}
+
+export async function createGameStore(supabase, defaults) {
+  validateGameSettings(defaults);
+  const games = new Map();
+
+  for (let offset = 0; ; offset += PAGE_SIZE) {
     const { data, error } = await supabase
-      .from(table)
-      .select(
-        "game_id,host_id,host_handle,users_in_game,state,time_limit,number_of_questions",
-      )
+      .from(TABLE)
+      .select(GAME_COLUMNS)
       .order("game_id")
-      .range(offset, offset + pageSize - 1)
-      .abortSignal(AbortSignal.timeout(5000));
-    if (error)
+      .range(offset, offset + PAGE_SIZE - 1)
+      .abortSignal(AbortSignal.timeout(QUERY_TIMEOUT_MS));
+
+    if (error || !Array.isArray(data)) {
       throw new Error(
         "Unable to load currentGames from Supabase. Check the server credentials and table columns.",
         { cause: error },
       );
-    for (const row of data) {
-      rows.set(row.game_id, row);
-      games.set(row.game_id, {
-        gameId: row.game_id,
-        hostId: row.host_id,
-        timeLimit: row.time_limit,
-        numberOfQuestions: row.number_of_questions,
-        players: row.users_in_game.map((id) => ({
-          id,
-          username:
-            id === row.host_id ? row.host_handle : `Player-${id.slice(0, 8)}`,
-        })),
-        started: row.state !== "waiting",
-      });
     }
-    if (data.length < pageSize) break;
+
+    for (const row of data) {
+      games.set(row.game_id, gameFromRow(row));
+    }
+    if (data.length < PAGE_SIZE) {
+      break;
+    }
   }
+
+  async function save(query, message) {
+    const { error } = await query.abortSignal(
+      AbortSignal.timeout(QUERY_TIMEOUT_MS),
+    );
+    if (error) {
+      console.error("Supabase game save failed", {
+        table: TABLE,
+        code: error.code,
+        message: error.message,
+        hint: error.hint,
+      });
+      throw new Error(message, { cause: error });
+    }
+  }
+
   return {
     list() {
       return structuredClone([...games.values()]);
     },
-    // Only host_handle is stored in this schema. Restore other display names
-    // from their authenticated sockets as players reconnect.
-    rememberPlayer(id, username) {
+
+    // The schema stores only the host's handle. Other names are restored on join.
+    rememberPlayer(userId, username) {
       for (const game of games.values()) {
-        const player = game.players.find((player) => player.id === id);
-        if (player) player.username = username;
+        const player = game.players.find((player) => player.id === userId);
+        if (player) {
+          player.username = username;
+        }
       }
     },
-    async replace(game, id) {
-      const previous = rows.get(id);
-      // Solo matches remain available to sockets, but have no persisted game row.
-      if (game?.solo || (!game && games.get(id)?.solo)) {
-        if (previous) {
-          const { error } = await supabase
-            .from(table)
-            .delete()
-            .eq("game_id", id)
-            .abortSignal(AbortSignal.timeout(5000));
-          if (error) throw new Error("Unable to remove solo game from the database.", { cause: error });
-        }
-        rows.delete(id);
-        if (game) games.set(id, structuredClone(game));
-        else games.delete(id);
-        return;
+
+    async replace(game, gameId) {
+      if (game && game.gameId !== gameId) {
+        throw new Error("The game ID must match the record being replaced.");
       }
-      const row = game
-        ? {
-            game_id: id,
-            host_id: game.hostId,
-            host_handle: game.players.find(
-              (player) => player.id === game.hostId,
-            ).username,
-            users_in_game: game.players.map((player) => player.id),
-            state: game.started ? "started" : "waiting",
-            time_limit: previous?.time_limit ?? game.timeLimit ?? timeLimit,
-            number_of_questions:
-              previous?.number_of_questions ??
-              game.numberOfQuestions ??
-              numberOfQuestions,
-          }
-        : null;
-      const query = row
-        ? supabase
-            .from(table)
-            .upsert(row, { onConflict: "game_id", defaultToNull: false })
-        : supabase.from(table).delete().eq("game_id", id);
-      const { error } = await query.abortSignal(AbortSignal.timeout(5000));
-      if (error) {
-        console.error("Supabase game save failed", {
-          table,
-          code: error.code,
-          message: error.message,
-          hint: error.hint,
-        });
-        throw new Error(
-          "Unable to save game. Check the server log for the database error.",
-          { cause: error },
-        );
-      }
-      if (game) {
-        games.set(
-          id,
-          structuredClone({
+
+      const previous = games.get(gameId);
+      const next = game
+        ? structuredClone({
             ...game,
-            timeLimit: row.time_limit,
-            numberOfQuestions: row.number_of_questions,
-          }),
-        );
-        rows.set(id, row);
+            timeLimit: previous?.timeLimit ?? game.timeLimit ?? defaults.timeLimit,
+            numberOfQuestions:
+              previous?.numberOfQuestions ??
+              game.numberOfQuestions ??
+              defaults.numberOfQuestions,
+          })
+        : null;
+
+      if (next) {
+        validateGameSettings(next);
+      }
+
+      // Solo matches stay in memory; starting one removes its persisted lobby.
+      if (next?.solo || (!next && previous?.solo)) {
+        if (previous && !previous.solo) {
+          await save(
+            supabase.from(TABLE).delete().eq("game_id", gameId),
+            "Unable to remove solo game from the database.",
+          );
+        }
       } else {
-        games.delete(id);
-        rows.delete(id);
+        const query = next
+          ? supabase.from(TABLE).upsert(rowFromGame(next), {
+              onConflict: "game_id",
+              defaultToNull: false,
+            })
+          : supabase.from(TABLE).delete().eq("game_id", gameId);
+        await save(
+          query,
+          "Unable to save game. Check the server log for the database error.",
+        );
+      }
+
+      // Commit the in-memory snapshot only after the database write succeeds.
+      if (next) {
+        games.set(gameId, next);
+      } else {
+        games.delete(gameId);
       }
     },
   };

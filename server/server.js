@@ -1,25 +1,17 @@
 import express from "express";
 import cors from "cors";
-import http from "http";
+import { createServer } from "node:http";
 import { Server } from "socket.io";
-import dotenv from "dotenv";
 import setUpSocket from "./socket/index.socket.js";
 import apiRoutes from "./routes/api.routes.js";
 import { supabase } from "./lib/supabase.js";
 import { createGameStore } from "./db/game-store.js";
-dotenv.config();
+import { readServerConfig } from "./lib/config.js";
 
-const frontendUrlSetting =
-  process.env.NODE_ENV === "production"
-    ? "FRONTEND_URL_PRODUCTION"
-    : "FRONTEND_URL_DEVELOPMENT";
-const frontendUrl = process.env[frontendUrlSetting];
-if (!frontendUrl) {
-  throw new Error(`Missing required environment variable: ${frontendUrlSetting}`);
-}
-
+const { frontendUrl, port, gameSettings } = readServerConfig();
+const store = await createGameStore(supabase, gameSettings);
 const app = express();
-const server = http.createServer(app);
+const server = createServer(app);
 
 const io = new Server(server, {
   cors: {
@@ -29,39 +21,31 @@ const io = new Server(server, {
   },
 });
 
-app.use(express.json());
 app.use(cors({ origin: frontendUrl, credentials: true }));
-
-app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`);
-  next();
-});
-
 app.use("/api", apiRoutes);
 
-const store = await createGameStore(supabase, {
-  timeLimit: Number(process.env.GAME_TIME_LIMIT_SECONDS ?? 30),
-  numberOfQuestions: Number(process.env.GAME_NUMBER_OF_QUESTIONS ?? 5),
-});
 const stopSockets = setUpSocket(io, {
   store,
   supabase,
   authenticate: async (token) => {
-    const {
-      data: { user },
-      error,
-    } = await supabase.auth.getUser(token);
-    if (error) throw error;
-    return user;
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error) {
+      throw error;
+    }
+    return data.user;
   },
 });
+
 let closing = false;
 function shutdown() {
-  if (closing) return;
+  if (closing) {
+    return;
+  }
   closing = true;
   stopSockets();
   io.close();
 }
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 server.on("error", (error) => {
@@ -70,7 +54,6 @@ server.on("error", (error) => {
   process.exitCode = 1;
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, "127.0.0.1", () => {
+server.listen(port, "127.0.0.1", () => {
   console.log(`Server listening on port ${server.address().port}`);
 });

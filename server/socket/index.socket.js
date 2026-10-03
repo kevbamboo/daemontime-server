@@ -1,11 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { createGameSessions, normalizeQuestion } from "./game-session.js";
-const ack = (cb, value) => {
-  if (typeof cb === "function") cb(value);
-};
-const room = (id) => `game:${id}`;
-const validGameSetting = (value) =>
-  Number.isInteger(value) && value >= 5 && value <= 99;
+import { loadQuestionBank } from "../db/question-bank.js";
+import { validateGameSettings } from "../lib/game-settings.js";
+import { createGameSessions } from "./game-session.js";
+
+const LOBBY_ROOM = "lobby";
+const CHAT_COOLDOWN_MS = 3000;
+const MAX_MESSAGE_LENGTH = 2000;
+const gameRoom = (gameId) => `game:${gameId}`;
+
+function acknowledge(callback, response) {
+  if (typeof callback === "function") {
+    callback(response);
+  }
+}
+
 function shuffled(items) {
   const result = [...items];
   for (let index = result.length - 1; index > 0; index--) {
@@ -15,25 +23,18 @@ function shuffled(items) {
   return result;
 }
 
-export async function loadQuestionBank(supabase) {
-  if (!supabase) throw new Error("Question database is not configured.");
-  const questions = [];
-  for (let offset = 0; ; offset += 1000) {
-    const { data, error } = await supabase
-      .from("questions")
-      .select(
-        "id,question,choices,answer,difficulty,short_explanation,long_explanation,source,type",
-      )
-      .order("id")
-      .range(offset, offset + 999)
-      .abortSignal(AbortSignal.timeout(5000));
-    if (error || !Array.isArray(data))
-      throw new Error(
-        "Unable to load questions. Check the question bank database schema.",
-      );
-    questions.push(...data.map(normalizeQuestion));
-    if (data.length < 1000) return questions;
-  }
+// Explicitly list public fields so private match data cannot reach the lobby.
+function publicGame(game) {
+  return {
+    gameId: game.gameId,
+    hostId: game.hostId,
+    players: game.players.map(({ id, username }) => ({ id, username })),
+    started: game.started,
+    timeLimit: game.timeLimit,
+    numberOfQuestions: game.numberOfQuestions,
+    ...(game.startedAt === undefined ? {} : { startedAt: game.startedAt }),
+    ...(game.solo === undefined ? {} : { solo: game.solo }),
+  };
 }
 
 export default function setUpSocket(
@@ -46,30 +47,53 @@ export default function setUpSocket(
     loadQuestions = () => loadQuestionBank(supabase),
   },
 ) {
-  // Serialize state changes across asynchronous database writes so two requests
-  // cannot both act on the same stale membership snapshot.
+  // Membership changes must finish their database writes before the next change.
   let pending = Promise.resolve();
+  let stopped = false;
   function enqueue(action) {
     const result = pending.then(action);
     pending = result.catch(() => {});
     return result;
   }
-  const connections = new Map();
+
+  const socketsByUser = new Map();
+  const disconnectDeadlines = new Map();
+  const pendingExpirations = new Set();
+  const lastMessageTimes = new Map();
   const sessions = createGameSessions({
     emit(userId, update) {
-      for (const socket of connections.get(userId) ?? []) {
-        if (socket.rooms.has(room(update.gameId)))
+      for (const socket of socketsByUser.get(userId) ?? []) {
+        if (socket.rooms.has(gameRoom(update.gameId))) {
           socket.emit("game-update", update);
+        }
       }
     },
   });
-  const deadlines = new Map();
-  // Question records (including answers) stay on the server.
-  const games = () => store.list();
-  const publicGame = ({ questions, ...game }) => game;
-  const publicGames = () => games().map(publicGame);
-  const gameUpdate = (game, userId) =>
-    sessions.snapshot(game.gameId, userId) ?? {
+
+  function publicGames() {
+    return store.list().map(publicGame);
+  }
+
+  function findPlayerGame(userId) {
+    return store.list().find((game) =>
+      game.players.some((player) => player.id === userId),
+    );
+  }
+
+  function publishGames() {
+    io.to(LOBBY_ROOM).emit("games-snapshot", publicGames());
+  }
+
+  function publishOnlineUsers() {
+    const users = [...socketsByUser].map(([id, sockets]) => ({
+      id,
+      username: sockets.values().next().value.data.username,
+    }));
+    io.to(LOBBY_ROOM).emit("online-users", users);
+  }
+
+  function gameUpdate(game, userId) {
+    return sessions.snapshot(game.gameId, userId) ?? {
       gameId: game.gameId,
       phase: "interrupted",
       serverNow: Date.now(),
@@ -82,136 +106,181 @@ export default function setUpSocket(
       message:
         "This game was interrupted by a server restart. Leave and create a new game.",
     };
-  const membership = (id) =>
-    games().find((g) => g.players.some((p) => p.id === id));
-  const publish = () => io.to("lobby").emit("games-snapshot", publicGames());
-  const publishOnlineUsers = () =>
-    io.to("lobby").emit(
-      "online-users",
-      [...connections]
-        .map(([id, sockets]) => ({
-          id,
-          username: [...sockets][0]?.data.username,
-        }))
-        .filter((user) => user.username),
-    );
-  for (const game of games())
-    for (const p of game.players) deadlines.set(p.id, Date.now() + graceMs);
-  async function removePlayer(id) {
-    const game = membership(id);
-    if (!game) return false;
-    const players = game.players.filter((p) => p.id !== id);
-    await store.replace(
-      players.length
-        ? {
-            ...game,
-            players,
-            hostId: game.hostId === id ? players[0].id : game.hostId,
-          }
-        : null,
-      game.gameId,
-    );
-    for (const s of connections.get(id) ?? []) s.leave(room(game.gameId));
-    sessions.leave(game.gameId, id);
-    deadlines.delete(id);
-    publish();
+  }
+
+  for (const game of store.list()) {
+    for (const player of game.players) {
+      disconnectDeadlines.set(player.id, Date.now() + graceMs);
+    }
+  }
+
+  async function removePlayer(userId) {
+    const game = findPlayerGame(userId);
+    if (!game) {
+      return false;
+    }
+
+    const players = game.players.filter((player) => player.id !== userId);
+    const nextGame = players.length
+      ? {
+          ...game,
+          players,
+          hostId: game.hostId === userId ? players[0].id : game.hostId,
+        }
+      : null;
+    await store.replace(nextGame, game.gameId);
+
+    for (const socket of socketsByUser.get(userId) ?? []) {
+      socket.leave(gameRoom(game.gameId));
+    }
+    sessions.leave(game.gameId, userId);
+    disconnectDeadlines.delete(userId);
+    publishGames();
     return true;
   }
-  const timer = setInterval(
-    () => {
-      for (const [id, deadline] of deadlines)
-        if (deadline <= Date.now()) {
-          void enqueue(async () => {
-            // The user may have reconnected while a database write was pending.
-            if (
-              connections.has(id) ||
-              (deadlines.get(id) ?? Infinity) > Date.now()
-            )
-              return;
-            await removePlayer(id);
-            deadlines.delete(id);
-          }).catch((error) =>
-            console.error("Unable to expire membership", error),
-          );
+
+  const expiryTimer = setInterval(() => {
+    for (const [userId, deadline] of disconnectDeadlines) {
+      if (deadline > Date.now() || pendingExpirations.has(userId)) {
+        continue;
+      }
+
+      pendingExpirations.add(userId);
+      void enqueue(async () => {
+        // Recheck after earlier writes: this player may have reconnected.
+        if (
+          stopped ||
+          socketsByUser.has(userId) ||
+          (disconnectDeadlines.get(userId) ?? Infinity) > Date.now()
+        ) {
+          return;
         }
-    },
-    Math.min(graceMs, 1000),
-  );
-  timer.unref();
+        await removePlayer(userId);
+        if (!socketsByUser.has(userId)) {
+          disconnectDeadlines.delete(userId);
+          lastMessageTimes.delete(userId);
+        }
+      })
+        .catch((error) => console.error("Unable to expire membership", error))
+        .finally(() => pendingExpirations.delete(userId));
+    }
+  }, Math.min(graceMs, 1000));
+  expiryTimer.unref();
+
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
-      if (typeof token !== "string" || !token) throw new Error("Missing token");
+      if (typeof token !== "string" || !token.trim()) {
+        throw new Error("Missing token");
+      }
       const user = await authenticate(token);
-      if (!user?.id) throw new Error("Invalid token");
+      if (stopped || typeof user?.id !== "string" || !user.id) {
+        throw new Error("Invalid token");
+      }
+
+      const username = user.user_metadata?.username;
       socket.data.userId = user.id;
-      const name = user.user_metadata?.username;
       socket.data.username = user.is_anonymous
         ? `Guest-${user.id.slice(0, 8)}`
-        : typeof name === "string" && name.trim()
-          ? name.trim().slice(0, 64)
+        : typeof username === "string" && username.trim()
+          ? username.trim().slice(0, 64)
           : `Player-${user.id.slice(0, 8)}`;
       next();
     } catch {
       next(new Error("Authentication failed"));
     }
   });
+
   io.on("connection", (socket) => {
     const userId = socket.data.userId;
-    if (!connections.has(userId)) connections.set(userId, new Set());
-    connections.get(userId).add(socket);
-    deadlines.delete(userId);
+    if (!socketsByUser.has(userId)) {
+      socketsByUser.set(userId, new Set());
+    }
+    socketsByUser.get(userId).add(socket);
+    disconnectDeadlines.delete(userId);
     socket.emit("socket-identity", { userId, username: socket.data.username });
     publishOnlineUsers();
-    // Install once; lobby joins only restore rooms and return a snapshot.
-    function handle(event, action) {
+
+    // Register each listener once; repeated lobby joins only restore state.
+    function handle(event, action, { queued = true } = {}) {
       socket.on(event, (...args) => {
-        const cb = typeof args.at(-1) === "function" ? args.pop() : undefined;
-        void enqueue(async () => {
-          if (!socket.connected) return;
-          if (event !== "join-lobby" && !socket.rooms.has("lobby"))
+        const callback =
+          typeof args.at(-1) === "function" ? args.pop() : undefined;
+        const run = async () => {
+          if (stopped || !socket.connected) {
+            return;
+          }
+          if (event !== "join-lobby" && !socket.rooms.has(LOBBY_ROOM)) {
             throw new Error("Join the lobby first");
-          ack(cb, { ok: true, data: await action(...args) });
-        }).catch((error) =>
-          ack(cb, { ok: false, error: error.message || "Request failed" }),
-        );
+          }
+          const data = await action(...args);
+          acknowledge(callback, { ok: true, data });
+        };
+
+        const result = queued ? enqueue(run) : run();
+        void result.catch((error) => {
+          acknowledge(callback, {
+            ok: false,
+            error: error.message || "Request failed",
+          });
+        });
       });
     }
-    function attach(game) {
-      for (const s of connections.get(userId) ?? []) s.join(room(game.gameId));
+
+    function attachToGame(game) {
+      for (const userSocket of socketsByUser.get(userId) ?? []) {
+        userSocket.join(gameRoom(game.gameId));
+      }
     }
-    function requireGame(id) {
-      if (typeof id !== "string") throw new Error("Invalid game ID");
-      const game = games().find((g) => g.gameId === id);
-      if (!game) throw new Error("Game no longer exists");
+
+    function requireGame(gameId) {
+      if (typeof gameId !== "string") {
+        throw new Error("Invalid game ID");
+      }
+      const game = store.list().find((game) => game.gameId === gameId);
+      if (!game) {
+        throw new Error("Game no longer exists");
+      }
       return game;
     }
+
+    function requireMembership(gameId) {
+      const game = requireGame(gameId);
+      if (
+        !game.players.some((player) => player.id === userId) ||
+        !socket.rooms.has(gameRoom(gameId))
+      ) {
+        throw new Error("You are not in this game");
+      }
+      return game;
+    }
+
     handle("join-lobby", () => {
-      socket.join("lobby");
+      socket.join(LOBBY_ROOM);
       store.rememberPlayer?.(userId, socket.data.username);
       publishOnlineUsers();
-      const game = membership(userId);
-      if (game) attach(game);
-      if (game) publish();
-      if (game?.started) socket.emit("game-update", gameUpdate(game, userId));
+
+      const game = findPlayerGame(userId);
+      if (game) {
+        attachToGame(game);
+        publishGames();
+        if (game.started) {
+          socket.emit("game-update", gameUpdate(game, userId));
+        }
+      }
       return publicGames();
     });
+
     handle("open-games", publicGames);
+
     handle("create-game", async (options) => {
-      if (
-        !options ||
-        !validGameSetting(options.timeLimit) ||
-        !validGameSetting(options.numberOfQuestions)
-      ) {
-        throw new Error(
-          "Time limit and number of questions must be whole numbers from 5 to 99.",
-        );
-      }
-      const existing = membership(userId);
+      validateGameSettings(options ?? {});
+      const existing = findPlayerGame(userId);
       if (existing) {
-        attach(existing);
+        attachToGame(existing);
         return publicGame(existing);
       }
+
       const game = {
         gameId: randomUUID(),
         hostId: userId,
@@ -221,73 +290,95 @@ export default function setUpSocket(
         numberOfQuestions: options.numberOfQuestions,
       };
       await store.replace(game, game.gameId);
-      attach(game);
-      publish();
+      attachToGame(game);
+      publishGames();
       return publicGame(game);
     });
-    handle("join-game", async (id) => {
-      const game = requireGame(id);
-      const existing = membership(userId);
-      if (existing && existing.gameId !== id)
+
+    handle("join-game", async (gameId) => {
+      const game = requireGame(gameId);
+      const existing = findPlayerGame(userId);
+      if (existing && existing.gameId !== gameId) {
         throw new Error("Leave your current game first");
-      if (!existing) {
-        if (game.started) throw new Error("Game already started");
-        game.players.push({ id: userId, username: socket.data.username });
-        await store.replace(game, id);
       }
-      attach(game);
-      publish();
+      if (!existing) {
+        if (game.started) {
+          throw new Error("Game already started");
+        }
+        game.players.push({ id: userId, username: socket.data.username });
+        await store.replace(game, gameId);
+      }
+      attachToGame(game);
+      publishGames();
       return publicGame(game);
     });
-    handle("start-game", async (id) => {
-      const game = requireGame(id);
-      if (game.hostId !== userId || !socket.rooms.has(room(id)))
+
+    handle("start-game", async (gameId) => {
+      const game = requireMembership(gameId);
+      if (game.hostId !== userId) {
         throw new Error("Only the host can start this game");
-      if (!game.started) {
-        if (
-          !validGameSetting(game.timeLimit) ||
-          !validGameSetting(game.numberOfQuestions)
-        ) {
-          throw new Error(
-            "Time limit and number of questions must be whole numbers from 5 to 99.",
-          );
-        }
-        const bank = await loadQuestions();
-        if (bank.length < game.numberOfQuestions)
-          throw new Error("Not enough questions available to start this game.");
-        const questions = shuffled(bank).slice(0, game.numberOfQuestions);
-        await store.replace(
-          {
-            ...game,
-            started: true,
-            startedAt: Date.now(),
-            solo: game.players.length === 1,
-          },
-          id,
-        );
-        publish();
-        sessions.start(game, questions);
       }
+      if (game.started) {
+        return true;
+      }
+
+      validateGameSettings(game);
+      const bank = await loadQuestions();
+      if (stopped) {
+        return false;
+      }
+      if (bank.length < game.numberOfQuestions) {
+        throw new Error("Not enough questions available to start this game.");
+      }
+
+      const questions = shuffled(bank).slice(0, game.numberOfQuestions);
+      await store.replace(
+        {
+          ...game,
+          started: true,
+          startedAt: Date.now(),
+          solo: game.players.length === 1,
+        },
+        gameId,
+      );
+      if (stopped) {
+        return false;
+      }
+      publishGames();
+      sessions.start(game, questions);
       return true;
     });
-    handle("submit-answer", (id, index, choice) => {
-      requireGame(id);
-      if (membership(userId)?.gameId !== id || !socket.rooms.has(room(id)))
-        throw new Error("You are not in this game");
-      return sessions.submit(id, userId, index, choice);
-    });
-    handle("leave-game", (id) => {
-      if (membership(userId)?.gameId !== id)
-        throw new Error("You are not in this game");
+
+    // Answer deadlines must not wait for another game's database requests.
+    handle(
+      "submit-answer",
+      (gameId, index, choice) => {
+        requireMembership(gameId);
+        return sessions.submit(gameId, userId, index, choice);
+      },
+      { queued: false },
+    );
+
+    handle("leave-game", (gameId) => {
+      requireMembership(gameId);
       return removePlayer(userId);
     });
-    let lastMessage = 0;
-    function message(target, text, gameId = null) {
-      if (typeof text !== "string" || !text.trim() || text.length > 2000)
+
+    function sendMessage(target, text, gameId = null) {
+      if (
+        typeof text !== "string" ||
+        !text.trim() ||
+        text.length > MAX_MESSAGE_LENGTH
+      ) {
         throw new Error("Messages must contain 1-2000 characters");
-      if (Date.now() - lastMessage < 3000)
+      }
+
+      const now = Date.now();
+      const lastMessageAt = lastMessageTimes.get(userId) ?? -Infinity;
+      if (now - lastMessageAt < CHAT_COOLDOWN_MS) {
         throw new Error("Message cooldown active");
-      lastMessage = Date.now();
+      }
+      lastMessageTimes.set(userId, now);
       io.to(target).emit("chat-message", {
         id: randomUUID(),
         userId,
@@ -297,25 +388,27 @@ export default function setUpSocket(
       });
       return true;
     }
-    handle("lobby-message", (text) => message("lobby", text));
-    handle("game-message", (id, text) => {
-      requireGame(id);
-      if (membership(userId)?.gameId !== id || !socket.rooms.has(room(id)))
-        throw new Error("You are not in this game");
-      return message(room(id), text, id);
+
+    handle("lobby-message", (text) => sendMessage(LOBBY_ROOM, text));
+    handle("game-message", (gameId, text) => {
+      requireMembership(gameId);
+      return sendMessage(gameRoom(gameId), text, gameId);
     });
+
     socket.on("disconnect", () => {
-      const active = connections.get(userId);
-      active?.delete(socket);
-      if (!active?.size) {
-        connections.delete(userId);
-        deadlines.set(userId, Date.now() + graceMs);
+      const activeSockets = socketsByUser.get(userId);
+      activeSockets?.delete(socket);
+      if (!activeSockets?.size) {
+        socketsByUser.delete(userId);
+        disconnectDeadlines.set(userId, Date.now() + graceMs);
         publishOnlineUsers();
       }
     });
   });
+
   return () => {
-    clearInterval(timer);
+    stopped = true;
+    clearInterval(expiryTimer);
     sessions.stop();
   };
 }

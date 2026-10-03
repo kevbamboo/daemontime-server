@@ -2,9 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
-import { io as client } from "../../client/node_modules/socket.io-client/build/esm/index.js";
+import { io as client } from "socket.io-client";
 import { once } from "node:events";
-import setUpSocket, { loadQuestionBank } from "../socket/index.socket.js";
+import setUpSocket from "../socket/index.socket.js";
+import { loadQuestionBank } from "../db/question-bank.js";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const request = (socket, event, ...args) =>
   socket.timeout(2000).emitWithAck(event, ...args);
@@ -120,7 +121,7 @@ test("question loader reads every page and normalizes numeric answer strings", a
         select(columns) {
           assert.equal(
             columns,
-            "id,question,choices,answer,difficulty,short_explanation,long_explanation,source,type",
+            "question,choices,answer,short_explanation,long_explanation",
           );
           return this;
         },
@@ -185,7 +186,7 @@ test(
     assert.deepEqual(observed, []);
   },
 );
-async function fixture(t) {
+async function fixture(t, overrides = {}) {
   const http = createServer();
   const io = new Server(http);
   const records = new Map();
@@ -214,6 +215,7 @@ async function fixture(t) {
       if (token === "invalid") throw new Error("Invalid token");
       return { id: token, user_metadata: { username: "same-name" } };
     },
+    ...overrides,
   });
   await new Promise((resolve) => http.listen(0, "127.0.0.1", resolve));
   const sockets = [];
@@ -227,13 +229,17 @@ async function fixture(t) {
       auth: { token: id },
       transports: ["websocket"],
       forceNew: true,
+      reconnection: false,
     });
     sockets.push(s);
-    await once(s, "connect");
+    await new Promise((resolve, reject) => {
+      s.once("connect", resolve);
+      s.once("connect_error", reject);
+    });
     if (lobby) assert.equal((await request(s, "join-lobby")).ok, true);
     return s;
   }
-  return { connect, store, io };
+  return { connect, store, io, stop };
 }
 test("identity authorizes host, lobby is idempotent, and membership is singular", async (t) => {
   const { connect, store } = await fixture(t);
@@ -397,5 +403,117 @@ test("game settings accept both boundaries and reject invalid requests without c
     assert.equal(result.data.numberOfQuestions, value);
     assert.equal(store.list()[0].timeLimit, value);
     await request(a, "leave-game", result.data.gameId);
+  }
+});
+
+test("answers are accepted while another game's database write is pending", { timeout: 8000 }, async (t) => {
+  const { connect, store } = await fixture(t);
+  const host = await connect("host");
+  const other = await connect("other");
+  const { data: game } = await request(host, "create-game", {
+    timeLimit: 5,
+    numberOfQuestions: 5,
+  });
+  const question = new Promise((resolve) => {
+    host.on("game-update", (update) => {
+      if (update.phase === "question") resolve(update);
+    });
+  });
+  await request(host, "start-game", game.gameId);
+  const update = await question;
+
+  const writeStarted = Promise.withResolvers();
+  const releaseWrite = Promise.withResolvers();
+  const replace = store.replace;
+  store.replace = async (...args) => {
+    writeStarted.resolve();
+    await releaseWrite.promise;
+    return replace(...args);
+  };
+  const creating = request(other, "create-game", {
+    timeLimit: 5,
+    numberOfQuestions: 5,
+  });
+  await writeStarted.promise;
+  try {
+    const answer = await host.timeout(1000).emitWithAck(
+      "submit-answer", game.gameId, update.questionIndex, 1,
+    );
+    assert.equal(answer.ok, true);
+  } finally {
+    releaseWrite.resolve();
+    await creating;
+  }
+});
+
+test("chat cooldown is shared across tabs and survives reconnects", async (t) => {
+  const { connect } = await fixture(t, { graceMs: 1000 });
+  const firstTab = await connect("account");
+  const secondTab = await connect("account");
+  assert.equal((await request(firstTab, "lobby-message", "first")).ok, true);
+  const second = await request(secondTab, "lobby-message", "too soon");
+  assert.equal(second.ok, false);
+  assert.match(second.error, /cooldown/);
+
+  firstTab.disconnect();
+  secondTab.disconnect();
+  const restored = await connect("account");
+  assert.equal(
+    (await request(restored, "lobby-message", "still too soon")).ok,
+    false,
+  );
+  const other = await connect("another-account");
+  assert.equal((await request(other, "lobby-message", "hello")).ok, true);
+});
+
+test("lobby snapshots expose only public game and player fields", async (t) => {
+  const { connect, store } = await fixture(t);
+  const host = await connect("host");
+  const { data: game } = await request(host, "create-game", {
+    timeLimit: 5,
+    numberOfQuestions: 5,
+  });
+  await store.replace(
+    {
+      ...game,
+      questions: [{ correctAnswer: 1 }],
+      answers: { host: 1 },
+      players: game.players.map((player) => ({ ...player, token: "private" })),
+    },
+    game.gameId,
+  );
+  assert.deepEqual((await request(host, "open-games")).data, [game]);
+});
+
+test("shutdown during a pending start does not create a new session", async (t) => {
+  const { connect, store, stop } = await fixture(t);
+  const host = await connect("host");
+  const { data: game } = await request(host, "create-game", {
+    timeLimit: 5,
+    numberOfQuestions: 5,
+  });
+  const updates = [];
+  host.on("game-update", (update) => updates.push(update));
+  const writeStarted = Promise.withResolvers();
+  const releaseWrite = Promise.withResolvers();
+  const replace = store.replace;
+  store.replace = async (...args) => {
+    writeStarted.resolve();
+    await releaseWrite.promise;
+    return replace(...args);
+  };
+
+  const starting = request(host, "start-game", game.gameId);
+  await writeStarted.promise;
+  stop();
+  releaseWrite.resolve();
+  assert.equal((await starting).data, false);
+  assert.deepEqual(updates, []);
+});
+
+test("missing and invalid tokens cannot connect", async (t) => {
+  const { connect } = await fixture(t);
+  for (const token of [undefined, "", "invalid"]) {
+    await assert.rejects(connect(token), /Authentication failed/);
   }
 });

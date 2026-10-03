@@ -1,8 +1,14 @@
 import { createClient } from "@supabase/supabase-js";
-import dotenv from "dotenv";
-dotenv.config();
+import { requiredSetting } from "./config.js";
 
 export const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SECRET_KEY,
+  requiredSetting("SUPABASE_URL"),
+  requiredSetting("SUPABASE_SECRET_KEY"),
+  {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  },
 );

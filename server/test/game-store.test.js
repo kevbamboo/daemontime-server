@@ -251,3 +251,40 @@ test("existing game settings survive updates and host transfer uses the new hand
   assert.equal(row.state, "started");
   assert.deepEqual(row.users_in_game, ["b"]);
 });
+
+test("invalid game settings, IDs, and hosts fail without changing saved state", async () => {
+  const db = database();
+  const defaults = { timeLimit: 30, numberOfQuestions: 5 };
+  for (const invalid of [null, {}, { ...defaults, timeLimit: 1 }]) {
+    await assert.rejects(createGameStore(db.supabase, invalid), /5 to 99/);
+  }
+
+  const store = await createGameStore(db.supabase, defaults);
+  await assert.rejects(
+    store.replace({ ...game, timeLimit: 100 }, game.gameId),
+    /5 to 99/,
+  );
+  await store.replace(game, game.gameId);
+  await assert.rejects(store.replace(game, "different-game"), /game ID/);
+  await assert.rejects(
+    store.replace({ ...game, hostId: "outsider" }, game.gameId),
+    /host must be one of its players/,
+  );
+  assert.deepEqual(store.list(), [game]);
+  assert.equal(db.records.size, 1);
+});
+
+test("changes to an input during a save cannot diverge from the database", async () => {
+  const db = database();
+  const store = await createGameStore(db.supabase, {
+    timeLimit: 30,
+    numberOfQuestions: 5,
+  });
+  const input = structuredClone(game);
+  const saving = store.replace(input, input.gameId);
+  input.players[0].username = "Changed during save";
+  await saving;
+
+  assert.deepEqual(store.list(), [game]);
+  assert.equal(db.records.get(game.gameId).host_handle, "A");
+});

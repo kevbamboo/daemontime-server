@@ -1,3 +1,4 @@
+// Optional cross-project checks: npm run test:client requires client dependencies.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";

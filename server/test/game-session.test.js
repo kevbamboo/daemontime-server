@@ -1,9 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  createGameSessions,
-  normalizeQuestion,
-} from "../socket/game-session.js";
+import { createGameSessions } from "../socket/game-session.js";
+import { normalizeQuestion } from "../db/question-bank.js";
 
 function fixture(count = 2, playerCount = 2) {
   let clock = 0;
@@ -186,6 +184,19 @@ test("stop cancels all timers and malformed question records are rejected", () =
     () => normalizeQuestion({ question: "Missing answers" }),
     /Questions must/,
   );
+  for (const row of [null, undefined]) {
+    assert.throws(() => normalizeQuestion(row), /Questions must/);
+  }
+  for (const answer of [true, false, [1], {}, null]) {
+    assert.throws(
+      () => normalizeQuestion({
+        question: "Invalid answer",
+        choices: ["a", "b", "c", "d"],
+        answer,
+      }),
+      /Questions must/,
+    );
+  }
   for (const choices of [
     null,
     "[]",
